@@ -1,11 +1,15 @@
+use std::collections::HashMap;
 use std::error::Error;
+use futures::future::join_all;
+
 
 use clap::{App, Arg};
-use log::{debug, info, trace, warn};
+use log::{debug, info, trace, warn, max_level};
 use mqttrs::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::net::TcpListener;
+use log::Level::Info;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -131,50 +135,56 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let _listener = TcpListener::bind(matches.value_of("listen-address").unwrap()).await.unwrap();
 
+    let mut clients = HashMap::new();
+
     loop {
-        // The portion below should both accept new connections and read data from the MQTT conn.
-        // Still need to figure out how to do this properly.
-        // tokio::select! {}
-        // let res = try_join!(
-        //     mqtt_conn.read(&mut buf),
-        //     listener.accept()
-        // );
-        //
-        // match res {
-        //     Ok((first, second)) => {
-        //         panic!("ok?");
-        //     }
-        //     Err(err) => { panic!("{:?}", err) }
-        // }
+        tokio::select! {
+            v = _listener.accept() => {
+                let (conn, addr) = v.unwrap();
+                debug!("Accepted connection: {:?}", conn);
+                clients.insert(addr, conn);
+            }
+            v = mqtt_conn.read(&mut buf) => {
+                let num_read = v.unwrap();
+                match decode_slice(&buf[..num_read]) {
+                    Ok(Some(pkt)) => {
+                        match pkt {
+                            Packet::Publish(msg) => {
+                                if max_level() >= Info {
+                                    let message = String::from_utf8_lossy(&msg.payload);
+                                    info!("Received message:\n\"{}\"", message);
+                                }
 
-        let num_read = mqtt_conn.read(&mut buf).await?;
-        match decode_slice(&buf[..num_read]) {
-            Ok(Some(pkt)) => {
-                match pkt {
-                    Packet::Publish(msg) => {
-                        let message = String::from_utf8_lossy(&msg.payload);
-                        info!("Received message:\n\"{}\"", message);
+                                // TODO: check if the client is still connected and discard if not.
+                                let mut futures = Vec::new();
+                                for (_, client_conn) in clients.iter_mut() {
+                                    futures.push(client_conn.write(&msg.payload));
+                                }
 
-                        let pub_ack = Packet::Puback(pid);
-                        let num_bytes = encode_slice(&pub_ack, &mut buf)?;
-                        mqtt_conn.write(&buf[..num_bytes]).await?;
+                                join_all(futures).await;
+
+                                let pub_ack = Packet::Puback(pid);
+                                let num_bytes = encode_slice(&pub_ack, &mut buf)?;
+                                mqtt_conn.write(&buf[..num_bytes]).await?;
+                            }
+                            Packet::Pingreq => {
+                                debug!("Received ping request");
+                                let ping_response = Packet::Pingresp;
+                                let num_bytes = encode_slice(&ping_response, &mut buf)?;
+                                mqtt_conn.write(&buf[..num_bytes]).await?;
+                            }
+                            Packet::Pingresp => {
+                                debug!("Received ping response");
+                            }
+                            _ => { trace!("Received packet: {:?}", pkt); }
+                        }
                     }
-                    Packet::Pingreq => {
-                        debug!("Received ping request");
-                        let ping_response = Packet::Pingresp;
-                        let num_bytes = encode_slice(&ping_response, &mut buf)?;
-                        mqtt_conn.write(&buf[..num_bytes]).await?;
+                    Ok(None) => {
+                        warn!("Probably didn't receive enough data (got {} bytes)", num_read)
                     }
-                    Packet::Pingresp => {
-                        debug!("Received ping response");
-                    }
-                    _ => { trace!("Received packet: {:?}", pkt); }
+                    other => panic!("Unexpected: {:?}", other)
                 }
             }
-            Ok(None) => {
-                warn!("Probably didn't receive enough data (got {} bytes)", num_read)
-            }
-            other => panic!("Unexpected: {:?}", other)
         }
     }
 }
