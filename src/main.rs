@@ -4,12 +4,34 @@ use futures::future::join_all;
 
 
 use clap::{App, Arg};
-use log::{debug, info, trace, warn, max_level};
+use log::{debug, info, trace, warn, error, max_level};
 use mqttrs::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::net::TcpListener;
 use log::Level::Info;
+use std::net::SocketAddr;
+use std::hash::{Hash, Hasher};
+
+struct ClientConnection {
+    remote_addr: SocketAddr,
+    stream: TcpStream,
+}
+
+impl PartialEq for ClientConnection {
+    fn eq(&self, other: &Self) -> bool {
+        self.stream.local_addr().unwrap() == other.stream.local_addr().unwrap()
+    }
+}
+
+impl Hash for ClientConnection {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.stream.local_addr().unwrap().hash(state);
+        self.remote_addr.hash(state);
+    }
+}
+
+impl Eq for ClientConnection {}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -72,21 +94,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .init()
         .unwrap();
 
-    // Not sure yet if I'm going to listen in a separate thread or let it get handled by tokio
-    // somehow. Leaving this here for now.
-    // let (tx, rx) = mpsc::channel();
-    // thread::spawn(async move {
-    //
-    //     loop {
-    //         let (socket, _) = listener.accept().await?;
-    //
-    //         tokio::spawn(async move {
-    //             // Process each socket concurrently.
-    //             process(socket).await
-    //         });
-    //     }
-    // });
-
     let mut buf = [0u8; 1024];
 
     // Encode an MQTT Connect packet.
@@ -135,6 +142,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let _listener = TcpListener::bind(matches.value_of("listen-address").unwrap()).await.unwrap();
 
+    // let mut clients = HashMap::new();
     let mut clients = HashMap::new();
 
     loop {
@@ -142,7 +150,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
             v = _listener.accept() => {
                 let (conn, addr) = v.unwrap();
                 debug!("Accepted connection: {:?}", conn);
-                clients.insert(addr, conn);
+                clients.insert(addr, Box::new(ClientConnection {
+                    remote_addr: addr,
+                    stream: conn,
+                }));
             }
             v = mqtt_conn.read(&mut buf) => {
                 let num_read = v.unwrap();
@@ -155,13 +166,32 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     info!("Received message:\n\"{}\"", message);
                                 }
 
-                                // TODO: check if the client is still connected and discard if not.
                                 let mut futures = Vec::new();
-                                for (_, client_conn) in clients.iter_mut() {
-                                    futures.push(client_conn.write(&msg.payload));
+                                // let mut written_to_clients = Vec::new();
+                                for (addr, client_conn) in clients.iter_mut() {
+                                    futures.push(client_conn.stream.write(&msg.payload));
+                                    // TODO: Immutable borrow so failure
+                                    // written_to_clients.push(&client_conn);
                                 }
 
-                                join_all(futures).await;
+                                if !futures.is_empty() {
+                                    let write_results = join_all(futures).await;
+                                    for (pos, write_result) in write_results.iter().enumerate() {
+                                        // let c = written_to_clients[pos].remote_addr;
+
+                                        match write_result {
+                                            Ok(v) => {
+                                                // trace!("Write result to {:?}: {:?}", c, v);
+                                                trace!("Write result to {:?}", v);
+                                            }
+                                            Err(e) => {
+                                                // TODO: remove from hash as the client has likely disconnected.
+                                                error!("Write failed: {:?}", e);
+                                                // error!("Write to {:?} failed: {:?}", c, e);
+                                            }
+                                        }
+                                    }
+                                }
 
                                 let pub_ack = Packet::Puback(pid);
                                 let num_bytes = encode_slice(&pub_ack, &mut buf)?;
